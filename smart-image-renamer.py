@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#!/usr/bin/python3
 
 # smart-image-renamer
 #
@@ -24,7 +24,8 @@ import argparse
 import itertools
 import os
 import re
-import shutil
+import datetime
+from pymediainfo import MediaInfo
 
 from PIL import Image
 from PIL.ExifTags import TAGS
@@ -37,8 +38,23 @@ class NotAnImageFile(Exception):
     pass
 
 
+class NotAVideoFile(Exception):
+    """This file is not a video"""
+    pass
+
+
 class InvalidExifData(Exception):
     """Could not find any EXIF or corrupted EXIF"""
+    pass
+
+
+class NoExifTimeStamp(Exception):
+    """Could not find 'DateTimeOriginal' or 'DateTimeDigitized' EXIF timestamp"""
+    pass
+
+
+class InvalidExifTimeStamp(Exception):
+    """Could not process EXIF Timestamp, which should be "YYYY:MM:DD HH:MM:SS" """
     pass
 
 
@@ -63,8 +79,8 @@ Format string for the file name is defined by a mix of custom text and following
   Artist      Artist
   Make        Camera Make
   Model       Camera Model
+  Height      Height of image in pixels
   Folder      Parent folder of the image file
-  File        Current Filename
 
 Examples:
   Format String:          {YYYY}-{MM}-{DD}-{Folder}-{Seq}
@@ -79,21 +95,23 @@ Examples:
     parser = argparse.ArgumentParser(description=help_description,
                                      formatter_class=argparse.RawTextHelpFormatter,
                                      epilog=help_epilog)
-    parser.add_argument('-f', dest='format', required=True, type=str,
-                        help='Format of the new file name')
-    parser.add_argument('-s', dest='sequence', type=int, default=1,
+    parser.add_argument('-f',
+                        dest='format',
+                        type=str,
+                        default='{YYYY}-{MM}-{DD}_{hh}-{mm}-{ss}_{Height}',
+                        help='Format of the new file name (default: {YYYY}-{MM}-{DD}_{hh}-{mm}-{ss}_{Height})')
+    parser.add_argument('-s',
+                        dest='sequence',
+                        type=int,
+                        default=1,
                         help='Starting sequence number (default: 1)')
     parser.add_argument('-r', dest='recursive', default=False,
                         action='store_true',
-                        help='Recursive mode')
+                        help='Recursive mode (default: False)')
     parser.add_argument('-i', dest='hidden', default=False,
-                        action='store_true', help='Include hidden files')
-    parser.add_argument('-c', dest='copy', default=False,
-                        action='store_true', help='Copy file')
-    parser.add_argument('-d', dest='destination', default="", type=str,
-                        help='Copy to destination')
+                        action='store_true', help='Include hidden files (default: False)')
     parser.add_argument('-t', dest='test', default=False, action='store_true',
-                        help='Test mode. Don\'t apply changes.')
+                        help='Test mode. Don\'t apply changes. (default: False)')
     parser.add_argument('-V', '--version', action='version',
                         version='%(prog)s {}'.format(__version__))
     group = parser.add_mutually_exclusive_group()
@@ -105,7 +123,7 @@ Examples:
     return parser.parse_args()
 
 
-def get_exif_data(img_file):
+def get_exif_data(img_file: str) -> dict:
     """Read EXIF data from the image.
 
     img_file: Absolute path to the image file
@@ -114,6 +132,8 @@ def get_exif_data(img_file):
 
     Raises: NotAnImageFile if file is not an image
             InvalidExifData if EXIF can't be processed
+            NoExifTimeStamp if EXIF does not contain timestamp
+            InvalidExifTimeStamp if EXIF DateTimeOriginal can't be processed
     """
     try:
         img = Image.open(img_file)
@@ -131,17 +151,117 @@ def get_exif_data(img_file):
         raise InvalidExifData
 
     # Add image format to EXIF
-    exif_data['format'] = img.format
+    exif_data['ext'] = img.format
+    exif_data['Height'] = str(img.height) + 'px'
+
+    # Find out the original timestamp or digitized timestamp from the EXIF
+    img_timestamp = (exif_data.get('DateTimeOriginal') or
+                     exif_data.get('DateTimeDigitized'))
+
+    if not img_timestamp:
+        raise NoExifTimeStamp
+
+    # Extract year, month, day, hours, minutes, seconds from timestamp
+    img_timestamp =\
+        re.search(r'(?P<YYYY>\d\d\d?\d?):(?P<MM>\d\d?):(?P<DD>\d\d?) '
+                  '(?P<hh>\d\d?):(?P<mm>\d\d?):(?P<ss>\d\d?)',
+                  img_timestamp.strip())
+
+    if not img_timestamp:
+        raise InvalidExifTimeStamp
+
+    exif_data.update(img_timestamp)
+
     return exif_data
 
-def move2dest(old, new, copy=False):
-    parent = os.path.dirname(new)
-    if not os.path.exists(parent):
-        os.makedirs(parent)
-    if copy:
-        shutil.copy2(old, new)
-    else:
-        shutil.move(old, new)
+
+def get_img_data(img_file: str) -> dict:
+    """ Read image data without EXIF
+
+    img_file: Absolute path to the image file
+
+    Returns: A dictionary containing 'height' and the modification timestamp.
+
+    Raises: NotAnImageFile if file is not an image
+    """
+    try:
+        img = Image.open(img_file)
+    except (OSError, IOError):
+        raise NotAnImageFile
+
+    img_data = dict()
+
+    img_data['ext'] = img.format
+    img_data['Height'] = str(img.height) + 'px'
+
+    dt = datetime.datetime.fromtimestamp(os.path.getmtime(img_file))
+    img_data['YYYY'] = dt.year
+    img_data['MM'] = dt.month
+    img_data['DD'] = dt.day
+    img_data['hh'] = dt.hour
+    img_data['mm'] = dt.minute
+    img_data['ss'] = dt.second
+    img_data['Artist'] = ''
+    img_data['Make'] = ''
+    img_data['Model'] = ''
+    return img_data
+
+
+def get_video_data(video_file: str) -> dict:
+    """ Uses mediainfo library to read resolution of video
+
+    Raises: NotAVideoFile if file is not a video
+    """
+
+    try:
+        vid = MediaInfo.parse(video_file)
+    except:
+        raise NotAVideoFile
+
+    isvideo = False
+    for track in vid.tracks:
+        if track.track_type == 'Video':
+            height = track.height
+            isvideo = True
+    if not isvideo:
+        raise NotAVideoFile
+
+    vid_data = dict()
+
+    vid_data['ext'] = vid.tracks[0].file_extension
+    vid_data['Height'] = str(height) + 'px'
+
+    dt = datetime.datetime.fromtimestamp(os.path.getmtime(video_file))
+    vid_data['YYYY'] = dt.year
+    vid_data['MM'] = dt.month
+    vid_data['DD'] = dt.day
+    vid_data['hh'] = dt.hour
+    vid_data['mm'] = dt.minute
+    vid_data['ss'] = dt.second
+    vid_data['Artist'] = ''
+    vid_data['Make'] = ''
+    vid_data['Model'] = ''
+
+    return vid_data
+
+
+def find_new_name(old_filename: str) -> str:
+    """ Adds sequence number and checks if file also exist. Tries until it finds a good number.
+
+    Returns: new filename of file that does not exist
+    """
+
+    sep_idx = old_filename.rfind('.')
+    base = old_filename[: sep_idx]
+    ext = old_filename[sep_idx:]
+
+    seq = 1
+    new_name = base + '_' + str(seq) + ext
+    while os.path.isfile(new_name):
+        seq = seq + 1
+        new_name = base + '_' + str(seq) + ext
+    return new_name
+
 
 if __name__ == '__main__':
     skipped_files = []
@@ -155,8 +275,14 @@ if __name__ == '__main__':
     test_mode = args.test
     recursive = args.recursive
     include_hidden = args.hidden
-    destination = os.path.expanduser(args.destination)
-    copymode = args.copy
+
+    # Make sure the month, days, hours, minutes and seconds have 2 digits
+    input_format = input_format.replace('{MM}', '{MM:02d}')
+    input_format = input_format.replace('{DD}', '{DD:02d}')
+    input_format = input_format.replace('{hh}', '{hh:02d}')
+    input_format = input_format.replace('{mm}', '{mm:02d}')
+    input_format = input_format.replace('{ss}', '{ss:02d}')
+    print("Actual format string:", input_format)
 
     for input_path in input_paths:
         for root, dirs, files in os.walk(input_path):
@@ -178,58 +304,42 @@ if __name__ == '__main__':
                 old_file_name = os.path.join(root, f)
                 try:
                     # Get EXIF data from the image
-                    exif_data = get_exif_data(old_file_name)
+                    tag_data = get_exif_data(old_file_name)
                 except NotAnImageFile:
-                    continue
-                except InvalidExifData:
-                    skipped_files.append((old_file_name, 'No EXIF data found'))
-                    continue
-
-                # Find out the original timestamp or digitized timestamp from the EXIF
-                img_timestamp = (exif_data.get('DateTimeOriginal') or
-                                 exif_data.get('DateTimeDigitized'))
-
-                if not img_timestamp:
-                    skipped_files.append((old_file_name,
-                                          'No timestamp found in image EXIF'))
-                    continue
-
-                # Extract year, month, day, hours, minutes, seconds from timestamp
-                img_timestamp =\
-                    re.search(r'(?P<YYYY>\d\d\d?\d?):(?P<MM>\d\d?):(?P<DD>\d\d?) '
-                              '(?P<hh>\d\d?):(?P<mm>\d\d?):(?P<ss>\d\d?)',
-                              img_timestamp.strip())
-
-                if not img_timestamp:
-                    skipped_files.append((old_file_name,
-                                          'Timestamp not in correct format'))
-                    continue
+                    try:
+                        tag_data = get_video_data(old_file_name)
+                    except NotAVideoFile:
+                        if not quiet:
+                            print('INFO: ' + old_file_name + ' is neither an image nor a video file!')
+                        continue
+                except:
+                    tag_data = get_img_data(old_file_name)
 
                 # Generate data to be replaced in user provided format
-                new_image_data = {'Artist': exif_data.get('Artist', ''),
-                                  'Make': exif_data.get('Make', ''),
-                                  'Model': exif_data.get('Model', ''),
-                                  'Folder': os.path.basename(root),
-                                  'File': os.path.splitext(f)[0],
-                                  'Seq': '{0:0{1}d}'.format(next(seq), seq_width),
-                                  'ext': exif_data.get('format', '')
-                                  }
-                new_image_data.update(img_timestamp.groupdict())
+                new_image_data = tag_data
+                new_image_data['Folder'] = os.path.basename(root),
+                new_image_data['Seq'] = '{0:0{1}d}'.format(next(seq), seq_width)
 
                 # Generate new file name according to user provided format
                 new_file_name = (input_format + '.{ext}').format(**new_image_data)
-                if destination:
-                    new_file_name_complete = os.path.join(destination, new_file_name)
-                else:
-                    new_file_name_complete = os.path.join(root, new_file_name)
+                new_file_name_complete = os.path.join(root, new_file_name)
+
+                # file already has correct file name, skip it
+                if old_file_name == new_file_name_complete:
+                    continue
+
+                # target file name is already there, maybe high-speed shutter
+                # was used (5 pics per second)
+                # add a sequence number, so manual comparison is simplified
+                if os.path.isfile(new_file_name_complete):
+                    new_file_name_complete = find_new_name(new_file_name_complete)
+                    if os.path.isfile(new_file_name_complete):
+                        print('ERROR: Something went terribly wrong...')
 
                 # Don't rename files if we are running in test mode
                 if not test_mode:
                     try:
-                        if copymode:
-                            move2dest(old_file_name, new_file_name_complete, copy=True)
-                        else:
-                            move2dest(old_file_name, new_file_name_complete)
+                        os.rename(old_file_name, new_file_name_complete)
                     except OSError:
                         skipped_files.append((old_file_name,
                                               'Failed to rename file'))
@@ -237,7 +347,7 @@ if __name__ == '__main__':
 
                 if verbose:
                     print('{0} --> {1}'.format(old_file_name,
-                                             new_file_name_complete))
+                                               new_file_name_complete))
                 elif not quiet:
                     print('{0} --> {1}'.format(f, new_file_name))
 
@@ -247,9 +357,3 @@ if __name__ == '__main__':
             # Break if recursive flag is not present
             if not recursive:
                 break
-
-    # Print skipped files
-    if skipped_files and not quiet:
-        print('\nSkipped Files:\n\t' + '\n\t'.join([file + ' (' + error + ')'
-                                                    for file, error in
-                                                    skipped_files]))

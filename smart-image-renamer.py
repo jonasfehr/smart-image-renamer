@@ -170,7 +170,17 @@ def get_exif_data(img_file: str) -> dict:
     if not img_timestamp:
         raise InvalidExifTimeStamp
 
-    exif_data.update(img_timestamp)
+    try:
+        exif_data.update(img_timestamp.groupdict())
+    except Exception:
+        print("Fatal Error: update of exif_data didn't work!")
+
+    exif_data['YYYY'] = int(exif_data['YYYY'])
+    exif_data['MM'] = int(exif_data['MM'])
+    exif_data['DD'] = int(exif_data['DD'])
+    exif_data['hh'] = int(exif_data['hh'])
+    exif_data['mm'] = int(exif_data['mm'])
+    exif_data['ss'] = int(exif_data['ss'])    
 
     return exif_data
 

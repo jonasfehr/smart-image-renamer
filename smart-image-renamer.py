@@ -20,17 +20,18 @@
 
 """Smart Image Renamer main module"""
 
+from _version import __version__
+from PIL.ExifTags import TAGS
+from PIL import Image
 import argparse
 import itertools
 import os
 import re
 import datetime
 from pymediainfo import MediaInfo
-
-from PIL import Image
-from PIL.ExifTags import TAGS
-
-from _version import __version__
+from geopy.geocoders import Nominatim
+from PIL.ExifTags import GPSTAGS
+import time
 
 
 class NotAnImageFile(Exception):
@@ -154,6 +155,21 @@ def get_exif_data(img_file: str) -> dict:
     exif_data['ext'] = img.format
     exif_data['Height'] = str(img.height) + 'px'
 
+    # get location as city and country
+    try:
+        geotags = get_geotagging(img._getexif())
+        coords = get_coordinates_new(exif_data['GPSInfo'])
+        #print(app.reverse("%s,%s" % coords))
+        address = get_address_by_location(
+            coords[0], coords[1]).get('address', '')
+        # print(address)
+        exif_data['City'] = address.get(
+            'town', address.get('suburb', 'unknown'))
+        exif_data['Country'] = address.get('country', 'unknown')
+    except:
+        exif_data['City'] = 'unknown'
+        exif_data['Country'] = 'unknown'
+
     # Find out the original timestamp or digitized timestamp from the EXIF
     img_timestamp = (exif_data.get('DateTimeOriginal') or
                      exif_data.get('DateTimeDigitized'))
@@ -180,7 +196,7 @@ def get_exif_data(img_file: str) -> dict:
     exif_data['DD'] = int(exif_data['DD'])
     exif_data['hh'] = int(exif_data['hh'])
     exif_data['mm'] = int(exif_data['mm'])
-    exif_data['ss'] = int(exif_data['ss'])    
+    exif_data['ss'] = int(exif_data['ss'])
 
     return exif_data
 
@@ -214,6 +230,9 @@ def get_img_data(img_file: str) -> dict:
     img_data['Artist'] = ''
     img_data['Make'] = ''
     img_data['Model'] = ''
+    img_data['City'] = 'unknown'
+    img_data['Country'] = 'unknown'
+
     return img_data
 
 
@@ -251,8 +270,80 @@ def get_video_data(video_file: str) -> dict:
     vid_data['Artist'] = ''
     vid_data['Make'] = ''
     vid_data['Model'] = ''
+    vid_data['City'] = 'unknown'
+    vid_data['Country'] = 'unknown'
 
     return vid_data
+
+# https://developer.here.com/blog/getting-started-with-geocoding-exif-image-metadata-in-python3
+
+
+def get_geotagging(exif):
+    if not exif:
+        raise ValueError("No EXIF metadata found")
+
+    geotagging = {}
+    for (idx, tag) in TAGS.items():
+        if tag == 'GPSInfo':
+            if idx not in exif:
+                raise ValueError("No EXIF geotagging found")
+
+            for (key, val) in GPSTAGS.items():
+                if key in exif[idx]:
+                    geotagging[val] = exif[idx][key]
+
+    return geotagging
+
+
+def get_decimal_from_dms(dms, ref):
+
+    degrees = dms[0]
+    minutes = dms[1] / 60.0
+    seconds = dms[2] / 3600.0
+
+    if ref in ['S', 'W']:
+        degrees = -degrees
+        minutes = -minutes
+        seconds = -seconds
+
+    return round(degrees + minutes + seconds, 5)
+
+
+def get_coordinates(geotags):
+    lat = get_decimal_from_dms(
+        geotags['GPSLatitude'], geotags['GPSLatitudeRef'])
+
+    lon = get_decimal_from_dms(
+        geotags['GPSLongitude'], geotags['GPSLongitudeRef'])
+
+    return (lat, lon)
+
+
+def get_coordinates_new(geoInfo):
+    lat = get_decimal_from_dms(
+        geoInfo[2], geoInfo[1])
+
+    lon = get_decimal_from_dms(
+        geoInfo[4], geoInfo[3])
+
+    return (lat, lon)
+
+
+def get_address_by_location(latitude, longitude, language="en"):
+    """This function returns an address as raw from a location
+    will repeat until success"""
+    # build coordinates string to pass to reverse() function
+    coordinates = f"{latitude}, {longitude}"
+    # sleep for a second to respect Usage Policy
+    time.sleep(1)
+    trials = 0
+    try:
+        return app.reverse(coordinates, language=language).raw
+    except:
+        trials += 1
+        if trials >= 5:
+            raise ValueError("No address found")
+        return get_address_by_location(latitude, longitude)
 
 
 def find_new_name(old_filename: str) -> str:
@@ -276,6 +367,7 @@ def find_new_name(old_filename: str) -> str:
 if __name__ == '__main__':
     skipped_files = []
     args = get_cmd_args()
+    app = Nominatim(user_agent="tutorial")
 
     input_paths = [os.path.abspath(input) for input in args.input]
     input_format = args.format
@@ -319,19 +411,22 @@ if __name__ == '__main__':
                     try:
                         tag_data = get_video_data(old_file_name)
                     except NotAVideoFile:
+                        tag_data = get_img_data(old_file_name)
                         if not quiet:
-                            print('INFO: ' + old_file_name + ' is neither an image nor a video file!')
+                            print('INFO: ' + old_file_name +
+                                  ' is neither an image nor a video file!')
                         continue
-                except:
-                    tag_data = get_img_data(old_file_name)
 
-                # Generate data to be replaced in user provided format
+                    # Generate data to be replaced in user provided format
                 new_image_data = tag_data
                 new_image_data['Folder'] = os.path.basename(root),
-                new_image_data['Seq'] = '{0:0{1}d}'.format(next(seq), seq_width)
+                new_image_data['File'] = os.path.splitext(f)[0],
+                new_image_data['Seq'] = '{0:0{1}d}'.format(
+                    next(seq), seq_width)
 
                 # Generate new file name according to user provided format
-                new_file_name = (input_format + '.{ext}').format(**new_image_data)
+                new_file_name = (
+                    input_format + '.{ext}').format(**new_image_data)
                 new_file_name_complete = os.path.join(root, new_file_name)
 
                 # file already has correct file name, skip it
@@ -342,7 +437,8 @@ if __name__ == '__main__':
                 # was used (5 pics per second)
                 # add a sequence number, so manual comparison is simplified
                 if os.path.isfile(new_file_name_complete):
-                    new_file_name_complete = find_new_name(new_file_name_complete)
+                    new_file_name_complete = find_new_name(
+                        new_file_name_complete)
                     if os.path.isfile(new_file_name_complete):
                         print('ERROR: Something went terribly wrong...')
 
